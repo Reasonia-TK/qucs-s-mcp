@@ -17,6 +17,7 @@ AIエージェントから回路シミュレーター **Qucs-S**（計算エン�
   - `move_components`: 部品を動かすと接続配線を自動で引き直します
 - **部品データベース** — インストール済み Qucs-S から 220 種のコンポーネント（プロパティ名・既定値・説明、ピン座標、シンボル外形）を自動抽出。ピン座標はネットリスト生成による実測で、回転・ミラーも Qucs と一致することを確認済み。ライブラリ部品(`Lib`)とサブ回路(`Sub`)はピンを動的に計測します。
 - **ngspice シミュレーション** — Qucs-S 自身にネットリストを生成させ (`qucs-s -n --ngspice`)、ngspice をバッチ実行。OP/DC スイープ/AC/過渡などの結果(ASCII/バイナリ raw)を解析し、要約・補間値・表・Bode 線図などで返します。
+  `export_results` で全点を CSV / JSON に書き出せます（複素数は `real_imag` / `mag_phase` / `db_phase` から選択）。
 
 ## 必要環境
 
@@ -65,7 +66,7 @@ claude mcp add qucs-s -- uv --directory <qucs-s-mcp のパス> run qucs-s-mcp
 | 部品 | `list_component_types` `get_component_type` `search_library` |
 | 編集 | `add_components` `add_component` `update_component` `move_components` `delete_components` |
 | 配線 | `connect` `add_wire` `delete_wires` `add_net_label` `reroute_wires` |
-| シミュレーション | `add_simulation` `add_spice_params` `add_nutmeg_equation` `get_netlist` `run_simulation` `get_results` `plot_results` |
+| シミュレーション | `add_simulation` `add_spice_params` `add_nutmeg_equation` `get_netlist` `run_simulation` `get_results` `export_results` `plot_results` |
 | 見る・整える | `snapshot` `check_layout` `tidy_schematic` `create_report` |
 
 座標系は Qucs と同じ（x 右向き、**y 下向き**、10 単位グリッド）。ピンは `"R1.1"`, `"Q1.B"`, `"OP1.OUT"`, `"V1.+"` のように指定します。編集は即座に .sch に保存されるので、`open_in_qucs_s` で Qucs-S の GUI にそのまま開けます。
@@ -76,7 +77,7 @@ claude mcp add qucs-s -- uv --directory <qucs-s-mcp のパス> run qucs-s-mcp
 2. `connect` で自動配線、観測したいノードに `add_net_label`（結果では `v(<label>)`）
 3. `add_simulation`（`tran` / `ac` / `dc` / `sweep` / `noise` …）
 4. `snapshot(nets=true, issues=true)` で画像を見て確認 → `tidy_schematic` / `move_components` / `reroute_wires` → 再度 `snapshot`
-5. `run_simulation` → `get_results` / `plot_results`
+5. `run_simulation` → `get_results`（要約・指定点の値）/ `export_results`（全点を CSV/JSON）/ `plot_results`
 6. `create_report` でユーザー向けのまとめ画像
 
 ## 仕組みのメモ

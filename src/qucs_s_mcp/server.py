@@ -128,7 +128,7 @@ def new_schematic(path: str, overwrite: bool = False) -> dict:
     if p.exists() and not overwrite:
         raise FileExistsError(f"{p} exists. Use open_schematic or overwrite=true.")
     STATE.sch = Schematic.new()
-    STATE.sch.save(p)
+    STATE.sch.save(p.resolve())
     return _ok(path=str(p))
 
 
@@ -138,7 +138,7 @@ def open_schematic(path: str) -> dict:
     p = Path(path)
     if not p.is_absolute() and not p.exists():
         p = workspace_dir() / p
-    STATE.sch = Schematic.load(p)
+    STATE.sch = Schematic.load(p.resolve())
     return get_schematic()
 
 
@@ -621,7 +621,9 @@ def get_results(analysis: str | None = None, vectors: list[str] | None = None,
     """Numeric results of the last simulation.
     analysis: name like "tr1"/"ac1"/"dc1" or kind "tran"/"ac"/"op".
     vectors: e.g. ["v(out)", "i(vpr1)"] (default all). at: x positions (time/frequency/sweep value)
-    at which values are interpolated; otherwise a decimated table of up to max_points rows."""
+    at which values are interpolated (complex AC values come back as mag / dB / phase_deg);
+    otherwise a decimated table of up to max_points rows (complex values as [re, im]).
+    For the full-resolution data use export_results (CSV/JSON file)."""
     import numpy as np
     p = _last().find(analysis)
     names = [plot.match_vector(p, v) for v in vectors] if vectors else [k for k in p.vectors if k != p.scale]
@@ -630,19 +632,24 @@ def get_results(analysis: str | None = None, vectors: list[str] | None = None,
         out["values"] = {n: _num(p.vectors[n][0]) for n in names}
         return out
     x = np.real(p.vectors[p.scale])
+    out["units"] = {n: p.units.get(n, "") for n in names}
     if at:
         out["at"] = {}
+        # interpolate log sweeps in log(x) so values between points stay accurate
+        logx = p.kind in ("ac", "noise") and x.size > 1 and x.min() > 0 and x.max() / x.min() > 50
+        xi = np.log10(x) if logx else x
         for xv in at:
             row = {}
+            xq = np.log10(xv) if logx and xv > 0 else xv
             for n in names:
                 y = p.vectors[n]
                 if np.iscomplexobj(y):
-                    re_ = np.interp(xv, x, y.real)
-                    im_ = np.interp(xv, x, y.imag)
+                    re_ = np.interp(xq, xi, y.real)
+                    im_ = np.interp(xq, xi, y.imag)
                     row[n] = {"mag": _num(abs(complex(re_, im_))), "dB": _num(20 * np.log10(max(abs(complex(re_, im_)), 1e-30))),
                               "phase_deg": _num(np.degrees(np.angle(complex(re_, im_))))}
                 else:
-                    row[n] = _num(np.interp(xv, x, y))
+                    row[n] = _num(np.interp(xq, xi, y))
             out["at"][str(xv)] = row
         return out
     idx = np.unique(np.linspace(0, len(x) - 1, min(max_points, len(x))).astype(int))
@@ -658,6 +665,56 @@ def get_results(analysis: str | None = None, vectors: list[str] | None = None,
     out["rows"] = rows
     out["summary"] = {n: simulate.describe_vector(p.vectors[n]) for n in names}
     return out
+
+
+@mcp.tool()
+def export_results(analysis: str | None = None, vectors: list[str] | None = None, format: str = "csv",
+                   complex_format: str = "real_imag", path: str | None = None) -> dict:
+    """Write the full-resolution results of the last simulation to CSV or JSON files.
+
+    analysis: "ac1" / "tr1" / "dc1" / kind ("ac", "tran", "op"); omit to export every analysis
+              (one file each).
+    vectors : subset to export (default: all). The sweep variable (time/frequency/...) is
+              always the first column.
+    format  : "csv" (header row + one row per point) or "json" (columns -> arrays).
+    complex_format (AC/noise vectors): "real_imag" (lossless, default) | "mag_phase" | "db_phase"
+              -> columns like "v(out).re", "v(out).im" or "v(out).dB", "v(out).phase_deg".
+    path    : output file (single analysis) or directory; default <schematic>_sim/<analysis>.<ext>.
+    """
+    res = _last()
+    fmt = format.lower()
+    if fmt not in ("csv", "json"):
+        raise ValueError("format must be 'csv' or 'json'")
+    plots = [res.find(analysis)] if analysis else list(res.plots)
+    base = Path(res.workdir)
+    out_dir = None
+    single_file = None
+    if path:
+        pp = Path(path)
+        if not pp.is_absolute():
+            pp = (STATE.workdir or workspace_dir()) / pp
+        if pp.suffix.lower() in (".csv", ".json") and len(plots) == 1:
+            single_file = pp
+        else:
+            out_dir = pp
+    files = []
+    for p in plots:
+        names = None
+        if vectors and analysis:
+            names = [plot.match_vector(p, v) for v in vectors]
+        elif vectors:
+            # with several analyses, export only the requested vectors that exist in each
+            names = []
+            for v in vectors:
+                try:
+                    names.append(plot.match_vector(p, v))
+                except KeyError:
+                    pass
+            if not names:
+                continue
+        target = single_file or (out_dir or base) / f"{_stem()}_{p.name}.{fmt}"
+        files.append(simulate.export_plot(p, target, names, fmt, complex_format))
+    return _ok(files=files)
 
 
 def _num(v) -> float:

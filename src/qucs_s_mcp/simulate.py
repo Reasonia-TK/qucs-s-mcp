@@ -152,8 +152,11 @@ def parse_raw(path: Path) -> list[Plot]:
                  scale=variables[0][0] if variables else None, source=str(path))
         for j, (vn, unit) in enumerate(variables):
             col = mat[:, j]
-            if complex_ and vn in ("frequency",):
-                col = col.real
+            if complex_ and (j == 0 or unit.split()[0].lower() in REAL_UNITS) \
+                    and not np.any(np.abs(col.imag) > 1e-12 * (np.abs(col.real).max() + 1e-300)):
+                # scale and real-valued post-processing results (e.g. dB(), ph()) are stored
+                # as complex numbers with zero imaginary part in a complex plot
+                col = col.real.copy()
             key = vn
             n = 2
             while key in p.vectors:
@@ -163,6 +166,9 @@ def parse_raw(path: Path) -> list[Plot]:
             p.units[key] = unit
         plots.append(p)
     return plots
+
+
+REAL_UNITS = {"frequency", "time", "decibel", "degree", "degrees", "radian", "radians", "hertz"}
 
 
 def _kind_from_title(title: str) -> str:
@@ -266,3 +272,57 @@ def simulate(sch_path: Path, timeout: float = 300) -> SimResult:
         raise RuntimeError("The schematic contains no simulation (add a .TR/.AC/.DC/... block "
                            "with add_simulation).")
     return run_netlist(net, workdir, timeout)
+
+
+# ------------------------------------------------------------------- export
+COMPLEX_FORMATS = ("real_imag", "mag_phase", "db_phase")
+
+
+def export_plot(p: Plot, path: Path, vectors: list[str] | None = None, fmt: str = "csv",
+                complex_format: str = "real_imag") -> dict:
+    """Write every point of an analysis to CSV or JSON. Returns columns / row count."""
+    import csv
+    import json
+
+    if complex_format not in COMPLEX_FORMATS:
+        raise ValueError(f"complex_format must be one of {COMPLEX_FORMATS}")
+    names = vectors or [k for k in p.vectors if k != p.scale]
+    cols: list[str] = []
+    data: list[np.ndarray] = []
+    if p.scale is not None:
+        cols.append(p.scale)
+        data.append(np.real(p.vectors[p.scale]))
+    for n in names:
+        v = p.vectors[n]
+        if np.iscomplexobj(v):
+            if complex_format == "real_imag":
+                cols += [f"{n}.re", f"{n}.im"]
+                data += [v.real, v.imag]
+            elif complex_format == "mag_phase":
+                cols += [f"{n}.mag", f"{n}.phase_deg"]
+                data += [np.abs(v), np.degrees(np.unwrap(np.angle(v)))]
+            else:
+                cols += [f"{n}.dB", f"{n}.phase_deg"]
+                data += [20 * np.log10(np.maximum(np.abs(v), 1e-300)), np.degrees(np.unwrap(np.angle(v)))]
+        else:
+            cols.append(n)
+            data.append(np.real(v))
+    mat = np.column_stack(data) if data else np.zeros((0, 0))
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "csv":
+        with path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            for row in mat:
+                w.writerow([repr(float(x)) for x in row])
+    elif fmt == "json":
+        path.write_text(json.dumps({
+            "analysis": p.name, "kind": p.kind, "title": p.title, "scale": p.scale,
+            "complex_format": complex_format, "columns": cols,
+            "units": {n: p.units.get(n, "") for n in ([p.scale] if p.scale else []) + names},
+            "data": {c: [float(x) for x in mat[:, i]] for i, c in enumerate(cols)},
+        }, ensure_ascii=False), encoding="utf-8")
+    else:
+        raise ValueError("fmt must be 'csv' or 'json'")
+    return {"analysis": p.name, "path": str(path), "columns": cols, "rows": int(mat.shape[0])}

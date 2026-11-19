@@ -95,3 +95,40 @@ def test_parse_print(tmp_path):
     f.write_text("v(out) = 1.250000e+00\ni(vpr1) = -2.0e-03\n")
     p = parse_print(f)
     assert p.vectors["v(out)"][0] == pytest.approx(1.25)
+
+
+def _ac_raw_with_db(tmp_path):
+    raw = tmp_path / "ac.raw"
+    raw.write_text(
+        "Title: t\nDate: d\nPlotname: AC Analysis\nFlags: complex\nNo. Variables: 3\nNo. Points: 2\n"
+        "Variables:\n\t0\tfrequency\tfrequency grid=3\n\t1\tv(out)\tvoltage\n\t2\tgain_db\tdecibel\n"
+        "Values:\n"
+        " 0\t1.0e+01,0.0e+00\n\t-4.7e+00,0.0e+00\n\t1.3442e+01,0.0e+00\n\n"
+        " 1\t1.0e+03,0.0e+00\n\t0.0e+00,-1.0e+00\n\t0.0e+00,0.0e+00\n")
+    return parse_raw(raw)[0]
+
+
+def test_decibel_vectors_are_real(tmp_path):
+    p = _ac_raw_with_db(tmp_path)
+    assert not np.iscomplexobj(p.vectors["gain_db"])
+    assert not np.iscomplexobj(p.vectors["frequency"])
+    assert np.iscomplexobj(p.vectors["v(out)"])   # genuine phasor stays complex
+    assert p.vectors["gain_db"][0] == pytest.approx(13.442)
+
+
+def test_export_csv_and_json(tmp_path):
+    import csv
+    import json
+    from qucs_s_mcp.simulate import export_plot
+    p = _ac_raw_with_db(tmp_path)
+    info = export_plot(p, tmp_path / "ac.csv", None, "csv", "db_phase")
+    assert info["rows"] == 2
+    rows = list(csv.reader(open(tmp_path / "ac.csv", encoding="utf-8")))
+    assert rows[0] == ["frequency", "v(out).dB", "v(out).phase_deg", "gain_db"]
+    assert float(rows[1][1]) == pytest.approx(20 * np.log10(4.7))
+    assert float(rows[2][2]) % 360 == pytest.approx(270.0)  # unwrapped from 180 deg = -90 deg
+    assert float(rows[1][3]) == pytest.approx(13.442)
+    export_plot(p, tmp_path / "ac.json", ["v(out)"], "json", "real_imag")
+    d = json.loads((tmp_path / "ac.json").read_text(encoding="utf-8"))
+    assert d["columns"] == ["frequency", "v(out).re", "v(out).im"]
+    assert d["data"]["v(out).im"] == [0.0, -1.0]
