@@ -49,14 +49,47 @@ def test_pins_and_connectivity():
     assert conn.net_of_pin("R1", 2).name == "gnd"
 
 
-def test_lint_detects_unconnected_t_junction():
+def test_t_junction_is_connected_like_qucs():
+    # verified with the qucs-s netlister: a wire END on another wire's middle joins the nets
     s = Schematic.new()
-    s.wires += [Wire(0, 0, 100, 0), Wire(50, 0, 50, 50)]
+    s.components += [Component.parse('R R1 1 100 100 0 0 0 0 "1k" 1'),
+                     Component.parse('R R2 1 180 160 0 0 0 1 "2k" 1')]   # R2 top pin at (180,130)
+    s.wires += [Wire(130, 100, 230, 100), Wire(180, 130, 180, 100)]
+    conn = layout.connectivity(s)
+    assert conn.net_of_pin("R1", 2).id == conn.net_of_pin("R2", 2).id
     issues, _ = layout.lint(s)
-    assert any(i.code == "t_junction_unconnected" for i in issues)
-    layout.normalize_wires(s, connect_t_junctions=True)
+    assert not any("junction" in i.code for i in issues)
+    # tidy makes the node explicit without changing connectivity
+    stats = layout.normalize_wires(s)
+    assert stats["split_t_junctions"] == 1 and len(s.wires) == 3
+
+
+def test_pin_on_wire_middle_is_not_connected():
+    s = Schematic.new()
+    s.components += [Component.parse('R R1 1 100 100 0 0 0 0 "1k" 1'),
+                     Component.parse('R R2 1 180 130 0 0 0 1 "2k" 1')]   # R2 top pin (180,100)
+    s.wires += [Wire(130, 100, 230, 100)]
+    conn = layout.connectivity(s)
+    assert conn.net_of_pin("R1", 2).id != conn.net_of_pin("R2", 2).id
     issues, _ = layout.lint(s)
-    assert not any(i.code == "t_junction_unconnected" for i in issues)
+    assert any(i.code == "pin_on_wire_unconnected" for i in issues)
+    layout.normalize_wires(s, connect_pins_on_wires=True)
+    conn = layout.connectivity(s)
+    assert conn.net_of_pin("R1", 2).id == conn.net_of_pin("R2", 2).id
+
+
+def test_connect_branches_instead_of_doubling():
+    s = Schematic.new()
+    s.components += [Component.parse('R R1 1 100 140 0 0 0 0 "1k" 1'),
+                     Component.parse('C C1 1 140 200 0 0 0 1 "1n" 1'),
+                     Component.parse('R R2 1 220 140 0 0 0 0 "1k" 1')]
+    layout.connect(s, "R1.2", "C1.2")
+    layout.connect(s, "R1.2", "R2.1")
+    issues, _ = layout.lint(s)
+    assert not any(i.code == "overlapping_wires" for i in issues)
+    conn = layout.connectivity(s)
+    assert len({conn.net_of_pin(*r).id for r in (("R1", 2), ("C1", 2), ("R2", 1))}) == 1
+    assert layout.connect(s, "R2.1", "C1.2") == []   # already connected -> nothing added
 
 
 def test_merge_collinear():
@@ -132,3 +165,18 @@ def test_export_csv_and_json(tmp_path):
     d = json.loads((tmp_path / "ac.json").read_text(encoding="utf-8"))
     assert d["columns"] == ["frequency", "v(out).re", "v(out).im"]
     assert d["data"]["v(out).im"] == [0.0, -1.0]
+
+
+def test_kind_from_title():
+    from qucs_s_mcp.simulate import _kind_from_title as k
+    assert k("DC transfer characteristic") == "dc"
+    assert k("AC Analysis") == "ac"
+    assert k("Transient Analysis") == "tran"
+    assert k("Operating Point") == "op"
+
+
+def test_parse_sweep_steps(tmp_path):
+    from qucs_s_mcp.simulate import parse_sweep_steps
+    f = tmp_path / "spice4qucs.tr1.cir.res"
+    f.write_text("STEP tr1.rx\n0  1000\n1  2000\n2  3000\n")
+    assert parse_sweep_steps(f) == [{"rx": 1000.0}, {"rx": 2000.0}, {"rx": 3000.0}]

@@ -118,6 +118,16 @@ def connectivity(sch: Schematic, workdir: Path | None = None) -> Connectivity:
     for i, w in enumerate(sch.wires):
         phys.union(("w", i), w.p1)
         phys.union(("w", i), w.p2)
+    # Qucs-S joins a wire END that lands on the middle of another wire (T-junction),
+    # verified against its netlister. A *pin* on a wire middle is NOT joined.
+    for i, w in enumerate(sch.wires):
+        if w.is_point():
+            continue
+        for j, o in enumerate(sch.wires):
+            if i != j:
+                for pt in (o.p1, o.p2):
+                    if w.contains(pt[0], pt[1], include_ends=False):
+                        phys.union(("w", i), ("w", j))
     for p in pins:
         phys.union(("p", p.comp, p.index), (p.x, p.y))
     # logical = physical + equal labels + all grounds
@@ -247,15 +257,8 @@ def lint(sch: Schematic, label_boxes: dict | None = None, wire_label_boxes: list
     for i, w in enumerate(sch.wires):
         if w.is_point():
             continue
-        for (x, y), idxs in endpoints.items():
-            if i in idxs:
-                continue
-            if w.contains(x, y, include_ends=False):
-                issues.append(Issue("error", "t_junction_unconnected",
-                                    f"wire end at ({x},{y}) touches the middle of wire #{i} but is NOT "
-                                    "connected (Qucs only joins at wire end points). Split the wire "
-                                    "or run tidy_schematic(connect_t_junctions=true).",
-                                    x, y, [f"wire#{i}"] + [f"wire#{j}" for j in idxs]))
+        # NB: a wire END on the middle of another wire is a valid T-junction in Qucs-S
+        # (it is connected), so only pins lying on a wire middle are reported.
         for p in conn.pins:
             if w.contains(p.x, p.y, include_ends=False):
                 issues.append(Issue("error", "pin_on_wire_unconnected",
@@ -483,9 +486,11 @@ class Router:
             self.pin_owner.setdefault((p.x, p.y), set()).add(self.conn.pin_net[(p.comp, p.index)])
 
     def route(self, start, goals: set, net_id: int | None, start_dir=None, goal_dirs: dict | None = None,
-              allowed: set | None = None):
-        """A* from start point to any of goals. Returns list of points or None."""
-        allowed = set(allowed or ()) | {start} | set(goals)
+              allowed: set | None = None, extra_starts: set | None = None):
+        """A* from start (plus optional extra start points, e.g. the grid points of wires already
+        attached to the start pin) to any of goals. Returns list of points or None."""
+        starts = {start} | set(extra_starts or ())
+        allowed = set(allowed or ()) | starts | set(goals)
         bx1, by1, bx2, by2 = self.bounds
         gl = list(goals)
 
@@ -493,12 +498,13 @@ class Router:
             return min(abs(pt[0] - g[0]) + abs(pt[1] - g[1]) for g in gl) // GRID
 
         counter = itertools.count()
-        openh = [(h(start), next(counter), 0, start, -1)]
-        best = {(start, -1): 0}
+        openh = [(h(s), next(counter), 0, s, -1) for s in starts]
+        heapq.heapify(openh)
+        best = {(s, -1): 0 for s in starts}
         parent = {}
         while openh:
             f, _, g, pt, d = heapq.heappop(openh)
-            if pt in goals and pt != start:
+            if pt in goals and pt not in starts:
                 path = [pt]
                 key = (pt, d)
                 while key in parent:
@@ -517,8 +523,13 @@ class Router:
                 if npt in self.blocked and npt not in allowed:
                     continue
                 # cannot leave a pin into its own body
-                if pt == start and pt in self.blocked and npt in self.blocked:
+                if pt in starts and pt in self.blocked and npt in self.blocked:
                     continue
+                # turning on a foreign wire's middle would create a T-junction (= connection)
+                if d >= 0 and nd != d:
+                    po_here = self.point_owner.get(pt)
+                    if po_here and (net_id is None or po_here - {net_id}):
+                        continue
                 # collinear overlap with a foreign wire?
                 if dx:
                     ek = (min(pt[0], nx), ny)
@@ -526,8 +537,8 @@ class Router:
                 else:
                     ek = (nx, min(pt[1], ny))
                     owners = self.vedge.get(ek)
-                if owners and (net_id is None or owners - {net_id}):
-                    continue
+                if owners:
+                    continue  # never run on top of an existing wire (any net)
                 cost = self.STEP
                 po = self.point_owner.get(npt)
                 pin_o = self.pin_owner.get(npt)
@@ -670,22 +681,26 @@ def connect(sch: Schematic, a, b, workdir=None, avoid_boxes=None) -> list[Wire]:
     # only logically the same net via labels / other ground symbols)
     for i in physical_wires_at(sch, (bx, by)):
         goals.update(_grid_points(sch.wires[i]))
-    goals.discard((ax, ay))
-    if not goals:
-        return []
+    # ... and starting from any wire already attached to the start, so a second connection
+    # from the same pin branches off the existing wiring instead of doubling it
+    starts = set()
+    for i in physical_wires_at(sch, (ax, ay)):
+        starts.update(_grid_points(sch.wires[i]))
+    if (ax, ay) in goals or goals & starts:
+        return []  # already connected
     sd = pin_outward(pa, router.comp_by_name.get(pa.comp), workdir) if pa else None
     gd = {(bx, by): pin_outward(pb, router.comp_by_name.get(pb.comp), workdir)} if pb else None
     # treat both nets as "own" for collision purposes
     if net_a is not None and net_b is not None and net_a != net_b:
         _merge_owner(router, net_b, net_a)
-    path = router.route((ax, ay), goals, net_id, sd, gd)
+    path = router.route((ax, ay), goals, net_id, sd, gd, extra_starts=starts)
     if path is None:
         raise RuntimeError(f"No orthogonal route found from {a} to {b}; move parts apart or route manually.")
     return add_polyline(sch, path)
 
 
 def physical_wires_at(sch: Schematic, pt) -> set[int]:
-    """Indices of wires connected (through wire end points only) to point pt."""
+    """Indices of wires electrically connected (through wire ends / T-junctions) to point pt."""
     start = {i for i, w in enumerate(sch.wires) if w.contains(pt[0], pt[1])}
     seen = set(start)
     frontier = [sch.wires[i] for i in start]
@@ -694,7 +709,10 @@ def physical_wires_at(sch: Schematic, pt) -> set[int]:
         for j, o in enumerate(sch.wires):
             if j in seen:
                 continue
-            if o.p1 in (w.p1, w.p2) or o.p2 in (w.p1, w.p2):
+            touch = o.p1 in (w.p1, w.p2) or o.p2 in (w.p1, w.p2)
+            # T-junctions (an end on the other wire's middle) are connected too
+            touch = touch or any(w.contains(x, y, include_ends=False) for x, y in (o.p1, o.p2))                 or any(o.contains(x, y, include_ends=False) for x, y in (w.p1, w.p2))
+            if touch:
                 seen.add(j)
                 frontier.append(o)
     return seen
@@ -957,9 +975,12 @@ def snap_to_grid(sch: Schematic) -> int:
     return n
 
 
-def normalize_wires(sch: Schematic, connect_t_junctions: bool = False, workdir=None) -> dict:
-    """Remove zero-length/duplicate wires, merge collinear chains, optionally split at T-junctions."""
-    stats = {"removed_zero_length": 0, "merged": 0, "split_t_junctions": 0, "removed_duplicates": 0}
+def normalize_wires(sch: Schematic, connect_pins_on_wires: bool = False, workdir=None) -> dict:
+    """Remove zero-length/duplicate wires, split wires at T-junctions (explicit node, same
+    connectivity), merge collinear chains. connect_pins_on_wires also splits wires where a pin
+    touches their middle, which CONNECTS that pin (Qucs-S leaves it unconnected otherwise)."""
+    stats = {"removed_zero_length": 0, "merged": 0, "split_t_junctions": 0, "connected_pins": 0,
+             "removed_duplicates": 0}
     # zero length without label
     before = len(sch.wires)
     sch.wires[:] = [w for w in sch.wires if not (w.is_point() and not w.label)]
@@ -974,17 +995,16 @@ def normalize_wires(sch: Schematic, connect_t_junctions: bool = False, workdir=N
         seen.add(k)
         uniq.append(w)
     sch.wires[:] = uniq
-    if connect_t_junctions:
-        changed = True
-        while changed:
-            changed = False
-            pts = {w.p1 for w in sch.wires} | {w.p2 for w in sch.wires}
-            pts |= {(p.x, p.y) for p in all_pins(sch, workdir)}
-            for (x, y) in pts:
-                if split_wire_at(sch, x, y):
-                    stats["split_t_junctions"] += 1
-                    changed = True
-                    break
+    pin_set = {(p.x, p.y) for p in all_pins(sch, workdir)} if connect_pins_on_wires else set()
+    changed = True
+    while changed:
+        changed = False
+        ends = {w.p1 for w in sch.wires} | {w.p2 for w in sch.wires}
+        for (x, y) in ends | pin_set:
+            if split_wire_at(sch, x, y):
+                stats["split_t_junctions" if (x, y) in ends else "connected_pins"] += 1
+                changed = True
+                break
     # merge collinear chains through degree-2 points that are not pins
     pin_pts = {(p.x, p.y) for p in all_pins(sch, workdir)}
     changed = True

@@ -697,7 +697,7 @@ def export_results(analysis: str | None = None, vectors: list[str] | None = None
     """Write the full-resolution results of the last simulation to CSV or JSON files.
 
     analysis: "ac1" / "tr1" / "dc1" / kind ("ac", "tran", "op"); omit to export every analysis
-              (one file each).
+              (one file each). A parameter-sweep base name ("tr1") exports every step.
     vectors : subset to export (default: all). The sweep variable (time/frequency/...) is
               always the first column.
     format  : "csv" (header row + one row per point) or "json" (columns -> arrays).
@@ -709,7 +709,7 @@ def export_results(analysis: str | None = None, vectors: list[str] | None = None
     fmt = format.lower()
     if fmt not in ("csv", "json"):
         raise ValueError("format must be 'csv' or 'json'")
-    plots = [res.find(analysis)] if analysis else list(res.plots)
+    plots = res.find_all(analysis) if analysis else list(res.plots)
     base = Path(res.workdir)
     out_dir = None
     single_file = None
@@ -749,10 +749,15 @@ def _num(v) -> float:
 def plot_results(analysis: str | None = None, vectors: list[str] | None = None, title: str | None = None,
                  mode: str = "auto", log_x: bool | None = None) -> list:
     """Plot vectors of the last simulation and return the image (Bode plot for AC: magnitude dB +
-    phase; time plot for transient; table for operating point). mode: auto | bode | real | mag."""
-    p = _last().find(analysis)
+    phase; time plot for transient; table for operating point). mode: auto | bode | real | mag.
+    For a parameter sweep pass its base name (e.g. "tr1") to overlay every step in one chart,
+    labelled with the swept parameter values (or "tr1_2" for a single step)."""
+    plots = _last().find_all(analysis)
     out = _next_path("plot")
-    info = plot.plot_vectors(p, vectors, out, title=title, mode=mode, logx=log_x)
+    if len(plots) > 1:
+        info = plot.plot_family(plots, vectors, out, title=title, logx=log_x)
+    else:
+        info = plot.plot_vectors(plots[0], vectors, out, title=title, mode=mode, logx=log_x)
     return [json.dumps({"path": info["path"], "stats": info["stats"]}, ensure_ascii=False),
             Image(path=info["path"])]
 
@@ -795,7 +800,7 @@ def snapshot(region: list[int] | None = None, focus: list[str] | None = None, ne
 @tool()
 def check_layout() -> dict:
     """Lint the schematic for electrical and visual problems:
-    errors (unconnected pins, wire ends / pins touching a wire middle which Qucs does NOT connect,
+    errors (unconnected pins, pins touching a wire middle which Qucs-S does NOT connect,
     overlapping parts), warnings (wires through symbols, overlapping wires, dangling nets) and
     style (off-grid, diagonal wires, texts overlapping symbols/wires/each other).
     Also returns wiring metrics (length, bends, crossings) to compare layouts."""
@@ -807,13 +812,15 @@ def check_layout() -> dict:
 
 @tool()
 def tidy_schematic(snap_to_grid: bool = True, merge_wires: bool = True,
-                   connect_t_junctions: bool = False, place_labels: bool = True,
+                   connect_pins_on_wires: bool = False, place_labels: bool = True,
                    reroute_all: bool = False, arrange_simulations: bool = True) -> dict:
     """Clean up the drawing:
       snap_to_grid        : put parts and wire ends on the 10-grid
       merge_wires         : remove zero-length / duplicate wires, merge straight chains
-      connect_t_junctions : split wires where another wire end or a pin touches their middle
-                            (makes visually-touching things electrically connected)
+      merge_wires also splits wires at T-junctions (a wire end on another wire's middle; Qucs-S
+                            already treats these as connected) so every node is explicit
+      connect_pins_on_wires : split wires where a PIN touches their middle - this CONNECTS the
+                            pin (Qucs-S leaves a pin on a wire middle unconnected)
       reroute_all         : rip up ALL wires and re-route them orthogonally (labels kept)
       place_labels        : move part name/value texts to the side with free space
       arrange_simulations : line up simulation/equation blocks below the circuit
@@ -822,8 +829,8 @@ def tidy_schematic(snap_to_grid: bool = True, merge_wires: bool = True,
     rep: dict = {}
     if snap_to_grid:
         rep["snapped"] = layout.snap_to_grid(sch)
-    if merge_wires or connect_t_junctions:
-        rep["wires"] = layout.normalize_wires(sch, connect_t_junctions, STATE.workdir)
+    if merge_wires or connect_pins_on_wires:
+        rep["wires"] = layout.normalize_wires(sch, connect_pins_on_wires, STATE.workdir)
     if reroute_all:
         rep["reroute"] = layout.reroute(sch, workdir=STATE.workdir)
         rep["wires_after_reroute"] = layout.normalize_wires(sch, False, STATE.workdir)

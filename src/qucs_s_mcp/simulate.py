@@ -25,11 +25,16 @@ class Plot:
     vectors: dict[str, np.ndarray] = field(default_factory=dict)
     units: dict[str, str] = field(default_factory=dict)
     source: str = ""
+    base: str = ""            # analysis name without sweep index, e.g. "tr1" for "tr1_2"
+    sweep: dict = field(default_factory=dict)   # parameter values of this sweep step
 
     def summary(self, max_vectors: int = 60) -> dict:
         out = {"analysis": self.name, "kind": self.kind, "title": self.title, "scale": self.scale,
                "points": int(len(next(iter(self.vectors.values())))) if self.vectors else 0,
                "vectors": {}}
+        if self.sweep:
+            out["base"] = self.base
+            out["sweep"] = self.sweep
         for k, v in list(self.vectors.items())[:max_vectors]:
             out["vectors"][k] = describe_vector(v, self.units.get(k, ""))
         return out
@@ -59,6 +64,16 @@ class SimResult:
             if p.kind == a or p.name.lower().startswith(a):
                 return p
         raise KeyError(f"No analysis '{analysis}'. Available: " + ", ".join(p.name for p in self.plots))
+
+    def find_all(self, analysis: str | None) -> list[Plot]:
+        """All steps of a parameter sweep when `analysis` names its base (e.g. "tr1")."""
+        if analysis:
+            a = analysis.lower()
+            if not any(p.name.lower() == a for p in self.plots):
+                steps = [p for p in self.plots if p.base.lower() == a and p.sweep]
+                if steps:
+                    return steps
+        return [self.find(analysis)]
 
 
 def describe_vector(v: np.ndarray, unit: str = "") -> dict:
@@ -172,12 +187,39 @@ REAL_UNITS = {"frequency", "time", "decibel", "degree", "degrees", "radian", "ra
 
 
 def _kind_from_title(title: str) -> str:
+    # word matches: "DC transfer characteristic" must not match "ac" inside "characteristic"
     t = title.lower()
-    for k, v in (("ac", "ac"), ("transient", "tran"), ("dc transfer", "dc"), ("operating", "op"),
-                 ("noise", "noise"), ("fourier", "fourier"), ("distortion", "disto"), ("pole", "pz")):
-        if k in t:
+    for pat, v in ((r"\bdc transfer\b", "dc"), (r"\bac\b", "ac"), (r"\btransient\b", "tran"),
+                   (r"\boperating\b", "op"), (r"\bnoise\b", "noise"), (r"\bfourier\b", "fourier"),
+                   (r"\bdistortion\b", "disto"), (r"\bpole", "pz"), (r"\bsensitivity\b", "sens")):
+        if re.search(pat, t):
             return v
     return "other"
+
+
+def parse_sweep_steps(path: Path) -> list[dict]:
+    """Parse the step table Qucs-S writes for parameter sweeps (spice4qucs.<sim>.cir.res):
+
+        STEP tr1.rx
+        0  1000
+        1  2000
+    -> [{"rx": 1000.0}, {"rx": 2000.0}]
+    """
+    names: list[str] = []
+    steps: list[dict] = []
+    for line in path.read_text(encoding="latin-1").splitlines():
+        tok = line.replace('"', " ").split()
+        if not tok:
+            continue
+        if tok[0].upper() == "STEP":
+            names = [n.split(".", 1)[-1] for n in tok[1:]]
+            continue
+        try:
+            vals = [float(v) for v in tok[1:]]
+        except ValueError:
+            continue
+        steps.append({n: v for n, v in zip(names or [f"p{i + 1}" for i in range(len(vals))], vals)})
+    return steps
 
 
 def parse_print(path: Path) -> Plot:
@@ -218,6 +260,8 @@ def run_netlist(netlist_path: Path, workdir: Path, timeout: float = 300) -> SimR
     expected = _output_files(netlist)
     for f in expected:
         (workdir / f).unlink(missing_ok=True)
+    for stale in workdir.glob("spice4qucs.*.cir.res"):
+        stale.unlink(missing_ok=True)
     t0 = time.time()
     try:
         proc = subprocess.run([str(tools().ngspice), "-b", netlist_path.name], cwd=str(workdir),
@@ -250,8 +294,16 @@ def run_netlist(netlist_path: Path, workdir: Path, timeout: float = 300) -> SimR
                 plots.append(pl)
             else:
                 sub = parse_raw(p)
+                base = _short_name(f)
+                steps = []
+                res_file = workdir / f"spice4qucs.{base}.cir.res"
+                if len(sub) > 1 and res_file.exists():
+                    steps = parse_sweep_steps(res_file)
                 for k, pl in enumerate(sub):
-                    pl.name = _short_name(f) + (f"_{k + 1}" if len(sub) > 1 else "")
+                    pl.base = base
+                    pl.name = base + (f"_{k + 1}" if len(sub) > 1 else "")
+                    if k < len(steps):
+                        pl.sweep = steps[k]
                     plots.append(pl)
         except Exception as e:  # noqa: BLE001
             errors.append(f"failed to parse {f}: {e}")

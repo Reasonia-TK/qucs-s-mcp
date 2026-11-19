@@ -117,6 +117,53 @@ def plot_vectors(plot: Plot, vectors: list[str] | None, out_png: Path, *, title:
     return {"path": str(out_png), "stats": stats}
 
 
+def plot_family(plots: list[Plot], vectors: list[str] | None, out_png: Path, *, title: str | None = None,
+                logx: bool | None = None, width_in: float = 8.0) -> dict:
+    """Overlay one vector over all steps of a parameter sweep (legend = parameter values)."""
+    first = plots[0]
+    xname = first.scale
+    if vectors:
+        names = [match_vector(first, v) for v in vectors]
+    else:
+        names = [k for k in first.vectors if k != xname][:1]
+    is_ac = first.kind in ("ac", "noise") or xname == "frequency"
+    fig, axes = plt.subplots(len(names), 1, figsize=(width_in, width_in * (0.45 + 0.3 * len(names))),
+                             sharex=True, squeeze=False)
+    stats: dict = {}
+    for row, n in enumerate(names):
+        ax = axes[row][0]
+        cmap = plt.get_cmap("viridis", max(len(plots), 2))
+        for k, p in enumerate(plots):
+            x = np.real(p.vectors[xname])
+            y = p.vectors[match_vector(p, n)]
+            if np.iscomplexobj(y):
+                y = 20 * np.log10(np.maximum(np.abs(y), 1e-30))
+                ylab = f"{n} [dB]"
+            else:
+                y = np.real(y)
+                ylab = n
+            lab = ", ".join(f"{kk}={EngFormatter().format_eng(v)}" for kk, v in p.sweep.items()) or p.name
+            ax.plot(x, y, color=cmap(k), lw=1.6, label=lab)
+            stats.setdefault(n, {})[lab] = {"min": float(f"{y.min():.6g}"), "max": float(f"{y.max():.6g}"),
+                                            "final": float(f"{y[-1]:.6g}")}
+        ax.set_ylabel(ylab)
+        lx = logx if logx is not None else (is_ac and x.min() > 0 and x.max() / x.min() > 50)
+        if lx:
+            ax.set_xscale("log")
+        elif xname == "time":
+            ax.xaxis.set_major_formatter(EngFormatter(unit="s"))
+        ax.legend(loc="best", fontsize=8, ncol=2 if len(plots) > 6 else 1)
+    axes[-1][0].set_xlabel({"time": "Time", "frequency": "Frequency [Hz]"}.get(xname, xname))
+    axes[0][0].set_title(title or f"{first.title} - parameter sweep ({first.base})", fontsize=12,
+                         loc="left", color="#24292f")
+    fig.tight_layout()
+    out_png = Path(out_png)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=110, facecolor="white")
+    plt.close(fig)
+    return {"path": str(out_png), "stats": stats}
+
+
 def _f3db(x, mag):
     if mag.size < 3:
         return None
