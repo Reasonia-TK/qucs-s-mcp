@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "qucs-s": {
+      "command": "uv",
+      "args": ["--directory", ".", "run", "qucs-s-mcp"]
+    }
+  }
+}
