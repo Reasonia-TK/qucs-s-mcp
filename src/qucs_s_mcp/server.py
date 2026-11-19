@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import Image, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from . import components as cdb
 from . import layout, plot, qucs_cli, render, simulate
@@ -37,6 +39,28 @@ Name nodes you want to plot with add_net_label (ngspice vector v(<label>)).
 """
 
 mcp = MCPServer("qucs-s", instructions=INSTRUCTIONS)
+
+
+def tool():
+    """Register a tool whose errors reach the agent with their message.
+
+    MCP SDK v2 hides the text of unexpected exceptions ("Error executing tool X"); agents
+    need the reason (unknown pin, no schematic open, bad argument...) to recover, so every
+    exception is re-raised as a ToolError carrying its type and message.
+    """
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except ToolError:
+                raise
+            except KeyError as e:   # KeyError's str() adds quotes around the message
+                raise ToolError(f"KeyError: {e.args[0] if e.args else e}") from e
+            except Exception as e:  # noqa: BLE001
+                raise ToolError(f"{type(e).__name__}: {e}") from e
+        return mcp.tool()(wrapper)
+    return deco
 
 
 # ====================================================================== state
@@ -114,7 +138,7 @@ def _ok(**kw) -> dict:
 
 
 # ================================================================ file tools
-@mcp.tool()
+@tool()
 def new_schematic(path: str, overwrite: bool = False) -> dict:
     """Create a new, empty Qucs-S schematic (.sch) and make it the current document.
 
@@ -132,7 +156,7 @@ def new_schematic(path: str, overwrite: bool = False) -> dict:
     return _ok(path=str(p))
 
 
-@mcp.tool()
+@tool()
 def open_schematic(path: str) -> dict:
     """Open an existing .sch file and make it the current document. Returns a summary."""
     p = Path(path)
@@ -142,7 +166,7 @@ def open_schematic(path: str) -> dict:
     return get_schematic()
 
 
-@mcp.tool()
+@tool()
 def get_schematic(verbose: bool = False) -> dict:
     """Describe the current schematic: components (position, rotation, shown properties,
     absolute pin coordinates + net), wires (with index), nets and bounding box.
@@ -178,7 +202,7 @@ def get_schematic(verbose: bool = False) -> dict:
             "bbox": [min(xs), min(ys), max(xs), max(ys)] if xs else None}
 
 
-@mcp.tool()
+@tool()
 def save_schematic(path: str | None = None) -> dict:
     """Save the current schematic (optionally to a new path, which becomes the current file)."""
     sch = STATE.need()
@@ -186,7 +210,7 @@ def save_schematic(path: str | None = None) -> dict:
     return _ok(path=str(p))
 
 
-@mcp.tool()
+@tool()
 def open_in_qucs_s() -> dict:
     """Open the current schematic in the Qucs-S GUI (for the user to inspect / edit by hand).
     Re-open the file with open_schematic afterwards if the user changed it."""
@@ -197,7 +221,7 @@ def open_in_qucs_s() -> dict:
 
 
 # ========================================================== component types
-@mcp.tool()
+@tool()
 def list_component_types(query: str = "", category: str = "", ngspice_only: bool = True,
                          limit: int = 60) -> list[dict]:
     """Search built-in Qucs-S component types (resistors, sources, transistors, simulations...).
@@ -224,7 +248,7 @@ def list_component_types(query: str = "", category: str = "", ngspice_only: bool
     return out
 
 
-@mcp.tool()
+@tool()
 def get_component_type(type: str) -> dict:
     """Full details of a component type: properties (names, defaults, descriptions),
     pin offsets at rotation 0, symbol body box."""
@@ -251,7 +275,7 @@ def _library_index() -> list[dict]:
     return out
 
 
-@mcp.tool()
+@tool()
 def search_library(query: str, limit: int = 40) -> list[dict]:
     """Search the Qucs-S component libraries (real op-amps, transistors, diodes, regulators...).
     Place a result with add_component(type="Lib", library=..., library_component=...)."""
@@ -305,7 +329,7 @@ def _place(sch: Schematic, spec: dict) -> tuple[Component, list[str]]:
     return comp, warns
 
 
-@mcp.tool()
+@tool()
 def add_components(components: list[dict]) -> dict:
     """Place one or more components. Each item:
       {"type": "R", "x": 200, "y": 100, "name": "R1"?, "rotation": 0|90|180|270, "mirror": false,
@@ -325,7 +349,7 @@ def add_components(components: list[dict]) -> dict:
     return _ok(placed=placed, warnings=warnings)
 
 
-@mcp.tool()
+@tool()
 def add_component(type: str, x: int, y: int, name: str | None = None, rotation: int = 0,
                   mirror: bool = False, properties: dict | None = None, library: str | None = None,
                   library_component: str | None = None, file: str | None = None) -> dict:
@@ -335,7 +359,7 @@ def add_component(type: str, x: int, y: int, name: str | None = None, rotation: 
                             "library_component": library_component, "file": file}])
 
 
-@mcp.tool()
+@tool()
 def update_component(name: str, properties: dict | None = None, new_name: str | None = None,
                      label_offset: list[int] | None = None, show_properties: dict | None = None,
                      active: bool | None = None) -> dict:
@@ -359,7 +383,7 @@ def update_component(name: str, properties: dict | None = None, new_name: str | 
     return _ok(component=_comp_info(c), warnings=warns)
 
 
-@mcp.tool()
+@tool()
 def move_components(moves: list[dict], keep_connections: bool = True) -> dict:
     """Move / rotate / mirror components. Each move: {"name": "R1", "x": .., "y": ..} or
     {"name": "R1", "dx": 50, "dy": 0}, optionally "rotation" (deg) and "mirror".
@@ -373,7 +397,7 @@ def move_components(moves: list[dict], keep_connections: bool = True) -> dict:
     return _ok(**res)
 
 
-@mcp.tool()
+@tool()
 def delete_components(names: list[str], delete_attached_wires: bool = True) -> dict:
     """Delete components. With delete_attached_wires the wires that only served them are removed too.
     Ground symbols can be addressed as "GND@x,y"."""
@@ -418,7 +442,7 @@ def _prune_dangling(sch: Schematic, start_pts: set) -> None:
                 break
 
 
-@mcp.tool()
+@tool()
 def connect(connections: list[list]) -> dict:
     """Auto-route orthogonal wires. connections: [["R1.2", "C1.1"], ["C1.2", [300, 200]], ...]
     Endpoints are pin refs ("R1.2", "Q1.B", "OP1.OUT") or [x, y] points (a point on an
@@ -431,12 +455,12 @@ def connect(connections: list[list]) -> dict:
             ws = layout.connect(sch, a, b, STATE.workdir)
             made.append({"from": a, "to": b, "segments": [[w.x1, w.y1, w.x2, w.y2] for w in ws]})
         except Exception as e:  # noqa: BLE001
-            failed.append({"from": a, "to": b, "error": str(e)})
+            failed.append({"from": a, "to": b, "error": e.args[0] if isinstance(e, KeyError) and e.args else str(e)})
     STATE.save()
     return _ok(ok=not failed, wired=made, failed=failed)
 
 
-@mcp.tool()
+@tool()
 def add_wire(points: list[list[int]], label: str | None = None) -> dict:
     """Draw a wire manually through the given points [[x1,y1],[x2,y2],...] (use orthogonal
     segments). Ends that land on the middle of an existing wire are joined properly."""
@@ -446,7 +470,7 @@ def add_wire(points: list[list[int]], label: str | None = None) -> dict:
     return _ok(segments=[[w.x1, w.y1, w.x2, w.y2] for w in ws])
 
 
-@mcp.tool()
+@tool()
 def delete_wires(indices: list[int] | None = None, net: str | None = None,
                  at: list[int] | None = None) -> dict:
     """Delete wires by index (see get_schematic), all wires of a net, or the wires touching point [x, y]."""
@@ -467,7 +491,7 @@ def delete_wires(indices: list[int] | None = None, net: str | None = None,
     return _ok(deleted=len(kill))
 
 
-@mcp.tool()
+@tool()
 def add_net_label(at: Any, name: str, text_offset: list[int] | None = None) -> dict:
     """Name a node. at = pin ref ("R1.2") or [x, y]. The label is attached to the wire at that
     point (or a zero-length wire stub if none). Named nodes appear as v(<name>) in results and
@@ -524,7 +548,7 @@ def _free_spot(sch: Schematic, w: int, h: int) -> tuple[int, int]:
     return x, y + 200
 
 
-@mcp.tool()
+@tool()
 def add_simulation(kind: str, properties: dict | None = None, x: int | None = None,
                    y: int | None = None, name: str | None = None) -> dict:
     """Add a simulation block. kind: tran | ac | dc (operating point) | sweep | noise | fourier |
@@ -555,7 +579,7 @@ def add_simulation(kind: str, properties: dict | None = None, x: int | None = No
                            if i < len(comp.props)}, warnings=warns)
 
 
-@mcp.tool()
+@tool()
 def add_spice_params(params: dict, x: int | None = None, y: int | None = None) -> dict:
     """Add a SPICE .PARAM block, e.g. {"Rload": "1k", "Vin": "1.5"}; use {Rload} in values."""
     sch = STATE.need()
@@ -568,7 +592,7 @@ def add_spice_params(params: dict, x: int | None = None, y: int | None = None) -
     return _ok(name=c.name)
 
 
-@mcp.tool()
+@tool()
 def add_nutmeg_equation(analysis: str, equations: dict, x: int | None = None, y: int | None = None) -> dict:
     """Add post-processing equations evaluated by ngspice after an analysis.
     analysis: ac | tran | dc ... ; equations e.g. {"gain_db": "dB(v(out)/v(in))"}.
@@ -583,7 +607,7 @@ def add_nutmeg_equation(analysis: str, equations: dict, x: int | None = None, y:
     return _ok(name=c.name)
 
 
-@mcp.tool()
+@tool()
 def get_netlist() -> str:
     """Return the ngspice netlist that Qucs-S generates for the current schematic."""
     sch = STATE.need()
@@ -592,7 +616,7 @@ def get_netlist() -> str:
         return qucs_cli.netlist_file(sch.path, Path(td) / "n.cir")
 
 
-@mcp.tool()
+@tool()
 def run_simulation(timeout_s: float = 300) -> dict:
     """Netlist the schematic with Qucs-S and run all its simulations in ngspice.
     Returns per-analysis summaries (vector names, min/max/final values) plus errors."""
@@ -615,7 +639,7 @@ def _last() -> simulate.SimResult:
     return r
 
 
-@mcp.tool()
+@tool()
 def get_results(analysis: str | None = None, vectors: list[str] | None = None,
                 at: list[float] | None = None, max_points: int = 50) -> dict:
     """Numeric results of the last simulation.
@@ -667,7 +691,7 @@ def get_results(analysis: str | None = None, vectors: list[str] | None = None,
     return out
 
 
-@mcp.tool()
+@tool()
 def export_results(analysis: str | None = None, vectors: list[str] | None = None, format: str = "csv",
                    complex_format: str = "real_imag", path: str | None = None) -> dict:
     """Write the full-resolution results of the last simulation to CSV or JSON files.
@@ -721,7 +745,7 @@ def _num(v) -> float:
     return float(f"{float(v):.6g}")
 
 
-@mcp.tool()
+@tool()
 def plot_results(analysis: str | None = None, vectors: list[str] | None = None, title: str | None = None,
                  mode: str = "auto", log_x: bool | None = None) -> list:
     """Plot vectors of the last simulation and return the image (Bode plot for AC: magnitude dB +
@@ -734,7 +758,7 @@ def plot_results(analysis: str | None = None, vectors: list[str] | None = None, 
 
 
 # ============================================================ layout & view
-@mcp.tool()
+@tool()
 def snapshot(region: list[int] | None = None, focus: list[str] | None = None, nets: bool = False,
              pins: bool = False, pin_names: bool = False, issues: bool = False,
              highlight: list[str] | None = None, grid: bool = True, rulers: bool = True,
@@ -768,7 +792,7 @@ def snapshot(region: list[int] | None = None, focus: list[str] | None = None, ne
     return [json.dumps(meta, ensure_ascii=False), Image(path=info["path"])]
 
 
-@mcp.tool()
+@tool()
 def check_layout() -> dict:
     """Lint the schematic for electrical and visual problems:
     errors (unconnected pins, wire ends / pins touching a wire middle which Qucs does NOT connect,
@@ -781,7 +805,7 @@ def check_layout() -> dict:
     return {"metrics": metrics, "issues": [i.as_dict() for i in iss]}
 
 
-@mcp.tool()
+@tool()
 def tidy_schematic(snap_to_grid: bool = True, merge_wires: bool = True,
                    connect_t_junctions: bool = False, place_labels: bool = True,
                    reroute_all: bool = False, arrange_simulations: bool = True) -> dict:
@@ -858,7 +882,7 @@ def _arrange_blocks(sch: Schematic) -> int:
     return moved
 
 
-@mcp.tool()
+@tool()
 def reroute_wires(nets: list[str] | None = None, components: list[str] | None = None) -> dict:
     """Rip up and re-route wiring orthogonally with the auto-router (labels are preserved).
     nets: net names (see get_schematic) ; components: re-route everything attached to these parts.
@@ -870,7 +894,7 @@ def reroute_wires(nets: list[str] | None = None, components: list[str] | None = 
     return _ok(**res, metrics=layout.wiring_metrics(sch))
 
 
-@mcp.tool()
+@tool()
 def create_report(title: str, notes: str = "", include_schematic: bool = True,
                   plots: list[dict] | None = None) -> list:
     """Compose a progress/result report image for the user: title bar, notes, a clean schematic
