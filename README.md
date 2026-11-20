@@ -93,3 +93,7 @@ uv run pytest -q tests/test_core.py
 uv run python tests/e2e_inverting_amp.py      # 回路を一から組んで整頓・シミュレーション・レポートまで
 uv run python tests/test_stdio_client.py      # 実際の MCP クライアントとして stdio 経由で呼び出し
 ```
+
+## ライセンス
+
+[MIT License](LICENSE)

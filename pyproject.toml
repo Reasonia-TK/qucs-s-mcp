@@ -3,6 +3,8 @@ name = "qucs-s-mcp"
 version = "0.1.0"
 description = "MCP server to drive the Qucs-S circuit simulator (ngspice) from AI agents, with schematic snapshots"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "matplotlib>=3.11.2",
     "mcp>=2.3.0",
