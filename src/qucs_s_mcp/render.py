@@ -44,6 +44,7 @@ def analyse(sch: Schematic, include_diagrams: bool = False) -> Analysis:
                                         extra_paintings=[svgtools.calibration_painting(*cal)])
     q = svgtools.parse(svg, cal)
     _fix_placeholder_captions(q, sch, subst)
+    _drop_open_end_marks(q, sch, subst)
     bbox = q.content_bbox_sch() or (0, 0, 100, 100)
     an = Analysis(q=q, substituted=subst, content_bbox=bbox)
     an.label_boxes = measure_label_boxes(q, sch)
@@ -58,7 +59,9 @@ def _fix_placeholder_captions(q: svgtools.QucsSvg, sch: Schematic, subst: list[s
     titles = {"SpicePar": ".PARAM", "SpiceGlobalPar": ".GLOBAL_PARAM", "NutmegEq": "Nutmeg",
               "SpiceInclude": ".INCLUDE", "SpiceLib": ".LIB", "SpiceOptions": ".OPTIONS",
               "SpiceIC": ".IC", "SpiceNodeset": ".NODESET", "SpiceFunc": ".FUNC", "SPICEINIT": ".spiceinit"}
-    targets = [(c, titles.get(c.type, c.type)) for c in sch.components if c.type in subst]
+    # only pin-less blocks were replaced by an Eqn box; parts with pins got a drawn symbol
+    targets = [(c, titles.get(c.type, c.type)) for c in sch.components
+               if c.type in subst and qucs_cli._symbol_paintings(c) is None]
     if not targets:
         return
     # find <text> elements nearest to each component origin
@@ -85,6 +88,49 @@ def _fix_placeholder_captions(q: svgtools.QucsSvg, sch: Schematic, subst: list[s
                 best, bd = el, d
         if best is not None:
             best.text = title
+
+
+def _drop_open_end_marks(q: svgtools.QucsSvg, sch: Schematic, subst: list[str]) -> None:
+    """Remove the red 'open wire end' circles Qucs draws at the pins of parts that were
+    replaced by drawn symbols (the wires do connect to those parts in the real schematic)."""
+    if not subst:
+        return
+    pts = []
+    for c in sch.components:
+        if c.type in subst:
+            try:
+                pts += [(p.x, p.y) for p in cdb.pins(c)]
+            except Exception:  # noqa: BLE001
+                pass
+    if not pts:
+        return
+    doomed = []
+
+    def walk(el, m, parent):
+        tag = el.tag.split("}")[-1]
+        if tag in ("g", "svg"):
+            mm = svgtools._mul(m, svgtools._matrix(el.get("transform")))
+            for ch in list(el):
+                walk(ch, mm, el)
+            return
+        if tag not in ("circle", "ellipse", "rect"):
+            return
+        stroke = (el.get("stroke") or (parent.get("stroke") if parent is not None else "") or "").lower()
+        if stroke not in ("#ff0000", "red"):
+            return
+        if tag == "rect":
+            cx = float(el.get("x", 0)) + float(el.get("width", 0)) / 2
+            cy = float(el.get("y", 0)) + float(el.get("height", 0)) / 2
+        else:
+            cx, cy = float(el.get("cx", 0)), float(el.get("cy", 0))
+        sx, sy = q.to_sch(*svgtools._apply(m, cx, cy))
+        if any(abs(sx - x) < 3 and abs(sy - y) < 3 for x, y in pts):
+            doomed.append((parent, el))
+
+    walk(q.root, (1, 0, 0, 1, 0, 0), None)
+    for parent, el in doomed:
+        if parent is not None:
+            parent.remove(el)
 
 
 def measure_label_boxes(q: svgtools.QucsSvg, sch: Schematic) -> dict:

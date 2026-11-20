@@ -82,15 +82,113 @@ def _placeholder_for(comp: Component) -> Component:
                      props=lines + [["no", 0]])
 
 
+_SOURCE_HINT = ("eqndef", "PWL", "Sffm", "NOISE", "RANDOM", "AmpMod", "S4Q_V", "S4Q_I", "eNL", "gNL")
+_INK = "#000080"
+
+
+def _symbol_paintings(comp: Component) -> list[str] | None:
+    """Draw a generic symbol for a component the CLI printer cannot load.
+
+    Uses Qucs paintings (lines, ellipse, rectangle, text) at the component's real pin
+    positions, so wiring still meets the symbol and the label shows name and values.
+    Returns None for pin-less blocks (handled by the Eqn stand-in instead).
+    """
+    from . import components as cdb  # local import: components imports this module lazily
+
+    try:
+        pins = cdb.pins(comp)
+    except Exception:  # noqa: BLE001
+        pins = []
+    if not pins or comp.type == "GND":
+        return None
+    cx, cy = comp.x, comp.y
+    out: list[str] = []
+    is_source = len(pins) == 2 and any(h.lower() in comp.type.lower() for h in _SOURCE_HINT)
+    if is_source:
+        r = 15
+        out.append(f"<Ellipse {cx - r} {cy - r} {2 * r} {2 * r} {_INK} 2 1 #c0c0c0 1 0>")
+        for p in pins:
+            dx, dy = p.x - cx, p.y - cy
+            d = max((dx * dx + dy * dy) ** 0.5, 1e-9)
+            if d > r:
+                ex, ey = cx + dx / d * r, cy + dy / d * r
+                out.append(f"<Line {p.x} {p.y} {round(ex - p.x)} {round(ey - p.y)} {_INK} 2 1>")
+        is_current = comp.type in ("S4Q_I", "S4Q_Ieqndef", "gNL", "iPWL", "iTRNOISE", "IAmpMod", "I")
+        if is_current:   # arrow pin1 -> pin2 inside the circle (direction of positive current)
+            p1, p2 = pins[0], pins[1]
+            dx, dy = p2.x - p1.x, p2.y - p1.y
+            d = max((dx * dx + dy * dy) ** 0.5, 1e-9)
+            ux, uy = dx / d, dy / d
+            out.append(f"<Arrow {round(cx - ux * 9)} {round(cy - uy * 9)} {round(ux * 18)} {round(uy * 18)} "
+                       f"7 3 {_INK} 2 1 1>")
+        else:            # '+' near pin 1
+            p1 = pins[0]
+            dx, dy = p1.x - cx, p1.y - cy
+            d = max((dx * dx + dy * dy) ** 0.5, 1e-9)
+            px, py = cx + dx / d * 8 + (-dy / d) * 0, cy + dy / d * 8
+            out.append(f'<Text {round(px - 4)} {round(py - 9)} 10 #ff0000 0 "+">')
+            glyph = "B" if comp.type in ("src_eqndef", "eNL") else ("PWL" if "PWL" in comp.type else "~")
+            out.append(f'<Text {cx - 4 * len(glyph)} {cy - 8} 10 {_INK} 0 "{glyph}">')
+    else:
+        xs = [p.x for p in pins]
+        ys = [p.y for p in pins]
+        x1, x2 = min(xs) + 10, max(xs) - 10
+        y1, y2 = min(ys) + 10, max(ys) - 10
+        if x2 - x1 < 24:
+            x1, x2 = cx - 12, cx + 12
+        if y2 - y1 < 24:
+            y1, y2 = cy - 12, cy + 12
+        out.append(f"<Rectangle {x1} {y1} {x2 - x1} {y2 - y1} {_INK} 2 1 #c0c0c0 1 0>")
+        for p in pins:
+            ex = min(max(p.x, x1), x2)
+            ey = min(max(p.y, y1), y2)
+            if (ex, ey) != (p.x, p.y):
+                out.append(f"<Line {p.x} {p.y} {ex - p.x} {ey - p.y} {_INK} 2 1>")
+        tag = comp.type.replace("_SPICE", "")[:6]
+        out.append(f'<Text {round((x1 + x2) / 2 - 4 * len(tag))} {round((y1 + y2) / 2 - 8)} 9 {_INK} 0 "{tag}">')
+    # name + displayed properties, where Qucs would put the component text
+    meta = cdb.info(comp.type) or {}
+    names = [q["name"] for q in meta.get("props", [])]
+    lines = [comp.name]
+    for i, (val, disp) in enumerate(comp.props):
+        if str(disp) == "1" and str(val):
+            n = names[i] if i < len(names) else ""
+            n = "" if n.startswith(("Line_", "p")) and n[-1:].isdigit() or "_Line" in n else n
+            lines.append(f"{n}={val}" if n else str(val))
+    text = "\\n".join(s.replace('"', "'") for s in lines)   # Qucs Text uses a literal \n
+    out.append(f'<Text {comp.x + comp.tx} {comp.y + comp.ty} 12 #000000 0 "{text}">')
+    return [o for o in out if o]
+
+
 def print_svg(sch: Schematic, out_svg: Path, *, strip_diagrams: bool = True,
               extra_paintings: list[str] | None = None) -> tuple[str, list[str]]:
     """Render ``sch`` to SVG with qucs-s. Returns (svg_text, substituted_types)."""
+    from . import components as cdb
+
     work = sch.copy()
     if strip_diagrams:
         work.raw_sections["Diagrams"] = []
     if extra_paintings:
         work.paintings().extend("  " + p for p in extra_paintings)
     substituted: list[str] = []
+
+    def substitute(pred) -> None:
+        keep = []
+        for c in work.components:
+            if not pred(c):
+                keep.append(c)
+                continue
+            if c.type not in substituted:
+                substituted.append(c.type)
+            paint = _symbol_paintings(c)
+            if paint is None:
+                keep.append(_placeholder_for(c))
+            else:
+                work.paintings().extend("  " + s for s in paint)
+        work.components = keep
+
+    # types already known to be unprintable are replaced up front (saves one qucs-s run each)
+    substitute(lambda c: (cdb.info(c.type) or {}).get("print_supported") is False)
     for _attempt in range(12):
         with tempfile.TemporaryDirectory(prefix="qucsmcp_p_") as td:
             sch_path = Path(td) / "print.sch"
@@ -105,10 +203,9 @@ def print_svg(sch: Schematic, out_svg: Path, *, strip_diagrams: bool = True,
         if not m:
             raise QucsError(f"qucs-s failed to print the schematic:\n{err}")
         bad = m.group(1).strip('"')
-        substituted.append(bad)
-        work.components = [
-            _placeholder_for(c) if c.type == bad else c for c in work.components
-        ]
+        if bad in substituted:
+            raise QucsError(f"qucs-s print cannot load '{bad}':\n{err}")
+        substitute(lambda c, bad=bad: c.type == bad)
     raise QucsError("qucs-s print kept failing on unknown devices: " + ", ".join(substituted))
 
 
